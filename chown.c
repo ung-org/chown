@@ -23,9 +23,12 @@
  */
 
 #define _XOPEN_SOURCE 700
+#include <errno.h>
 #include <ftw.h>
 #include <grp.h>
+#include <inttypes.h>
 #include <limits.h>
+#include <locale.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,61 +37,63 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define NOFOLLOW	0
-#define FOLLOWARGV	1
-#define FOLLOWALL	2
-
+static enum { NOFOLLOW, FOLLOWARGV, FOLLOWALL } links = FOLLOWARGV;
 static int recursive = 0;
-static int links = FOLLOWARGV;
 static uid_t newowner = -1;
 static gid_t newgroup = -1;
+static int retval = 0;
 
-int _chown(const char *);
-
-int nftw_chown(const char *p, const struct stat *sb, int typeflag,
-	       struct FTW *f)
+static int nftw_chown(const char *p, const struct stat *st, int typeflag, struct FTW *f)
 {
-	(void)sb; (void)typeflag; (void)f;
-	return _chown(p);
-}
+	(void)typeflag; (void)f;
 
-int _chown(const char *p)
-{
-	struct stat st;
-	if (lstat(p, &st) != 0) {
-		perror(p);
-		return 1;
+	if (st == NULL) {
+		fprintf(stderr, "chown: %s: unknown error\n", p);
+		retval = 1;
+
+	} else if (S_ISLNK(st->st_mode)) {
+		/* handle specially */
+
+	} else {
+		if (chown(p, newowner, newgroup) != 0) {
+			fprintf(stderr, "chown: %s: %s\n", p, strerror(errno));
+			retval = 1;
+		}
 	}
-	// FIXME: about symlinks....
-	// if (links == NOFOLLOW
-	// lchown (p, newowner, newgroup) 
-	if (chown(p, newowner, newgroup) != 0) {
-		perror(p);
-	}
+
 	return 0;
 }
 
-static void chown_parse(const char *ug)
+static void parse_owner(char *owner)
 {
-	char *colon = strchr(ug, ':');
-	if (colon == NULL) {
-		struct passwd *pwd = getpwnam(ug);
-		if (pwd == NULL)
-			exit(1);
-		newowner = pwd->pw_uid;
-	} else {
-		struct passwd *pwd;
-		struct group *grp;
-		char user[NAME_MAX];
-		strcpy(user, ug);
-		user[strlen(ug) - strlen(colon)] = '\0';
-		pwd = getpwnam(user);
-		grp = getgrnam(&colon[1]);
-		if (pwd == NULL || grp == NULL) {
-			exit(1);
+	char *colon = strchr(owner, ':');
+	if (colon) {
+		*colon = '\0';
+		char *grpname = colon + 1;
+		struct group *grp = getgrnam(grpname);
+		if (!grp) {
+			char *end;
+			newgroup = (gid_t)strtoumax(grpname, &end, 0);
+			if (end && *end != '\0') {
+				printf("chown: couldn't find group '%s'\n",
+					grpname);
+				exit(0);
+			}
+		} else {
+			newgroup = grp->gr_gid;
 		}
+	}
+
+	struct passwd *pwd = getpwnam(owner);
+	if (!pwd) {
+		char *end;
+		newowner = (uid_t)strtoumax(owner, &end, 0);
+		if (end && *end != '\0') {
+			printf("chown: couldn't find user '%s'\n", owner);
+			exit(0);
+		}
+	} else {
 		newowner = pwd->pw_uid;
-		newgroup = grp->gr_gid;
 	}
 }
 
@@ -99,34 +104,45 @@ int do_chown(char *path, int recurse, int howlinks, uid_t uid, gid_t gid)
 	newowner = uid;
 	newgroup = gid;
 	// FIXME: This is where to recurse and handle the difference betwixt links types
-	return _chown(path);
+	return nftw_chown(path, NULL, 0, NULL);
 }
 
 int main(int argc, char *argv[])
 {
+	setlocale(LC_ALL, "");
+
 	int c;
-	while ((c = getopt(argc, argv, ":hHLPR")) != -1) {
+	while ((c = getopt(argc, argv, "hHLPR")) != -1) {
 		switch (c) {
 		case 'h':
-			if (recursive)
+			if (recursive) {
 				return 1;
+			}
+
 			recursive = -1;
 			links = NOFOLLOW;
 			break;
+
 		case 'H':
 			links = FOLLOWARGV;
 			break;
+
 		case 'L':
 			links = FOLLOWALL;
 			break;
+
 		case 'P':
 			links = NOFOLLOW;
 			break;
+
 		case 'R':
-			if (recursive == -1)
+			if (recursive == -1) {
 				return 1;
+			}
+
 			recursive = 1;
 			break;
+
 		default:
 			return 1;
 		}
@@ -136,7 +152,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	chown_parse(argv[optind++]);
+	parse_owner(argv[optind++]);
 
 	while (optind < argc) {
 		do_chown(argv[optind], recursive, links, newowner, newgroup);
